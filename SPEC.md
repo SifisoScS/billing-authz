@@ -1,4 +1,10 @@
-# billing-authz — Specification v1.1
+# billing-authz — Specification v1.2
+
+> **Amendment 2 (2026-09-26):** makes the specification internally consistent, as found by its
+> translation into a Blueprint (Repository Engine 1000, `blueprints/billing-authz.TRANSLATION.md`):
+> 29 gaps resolved, including a contradiction that made AT-54, AT-55 and AT-58 impossible to pass
+> and AT-31, which could not be written. Five acceptance tests reworded (AT-15, AT-31, AT-32, AT-47,
+> AT-56); the count stays 60.
 
 > **Amendment 1 (2026-09-26, AE-D36):** policy zones with a defined matching rule; SCA across the
 > EEA plus the UK; the rand (ZAR) as a first-class currency; AT-54…AT-60. The founding version
@@ -134,7 +140,7 @@ type Obligation =
 interface Reason { code: string; stage: StageName; message: string; details?: Record<string, unknown> }
 
 interface Decision {
-  decisionId: string;
+  decisionId: string;        // UUID v4, from an injectable id source (Amendment 2)
   decision: DecisionKind;
   obligations: Obligation[];
   reasons: Reason[];
@@ -191,12 +197,20 @@ action?* — plans and entitlements for customers, roles for operators.)
 | `DecisionLog` | Append-only record of decisions (§7) | `InMemoryDecisionLog` |
 | `IdempotencyStore` | Decisions by idempotency key | `InMemoryIdempotencyStore` |
 
+**Records the ports return (Amendment 2):**
+- **Subject:** `{ type, status: "active" | "suspended" | "closed", homeRegion?, roles: string[], flags: ("fraud" | "legal_hold")[], plan? }`.
+  A `user`'s entitlements, plan and payment state are its **own** records (no account inheritance in this slice).
+- **Entitlement:** `{ feature, validFrom?, validUntil? }`, valid at *now* when `validFrom ≤ now < validUntil`; a missing bound is open.
+- **Quota:** `{ key, used, limit, mode }`. A request's quota is the one keyed by the **feature** of `use_feature:<key>`.
+- **PaymentHealth:** `{ state: "active" | "past_due", graceUntil? }`.
+
 ## 5. Decision semantics
 
 ### 5.1 Pipeline
 
 Stages run in the order of §4.3. Each returns `pass`, `deny`, `verify`, or `limit` (with obligations),
-plus reasons. **A `deny` stops the pipeline immediately**: later stages, including external
+plus reasons. **Within a stage, rules are evaluated in the order written below; the first `deny` is
+the one reported** (Amendment 2). **A `deny` stops the pipeline immediately**: later stages, including external
 calls, do not run.
 
 **Regions:** a region is **blocked** if either the request's `context.region` or the subject's home
@@ -216,22 +230,24 @@ Zones contain only ISO-3166 alpha-2 codes; they do not nest. The rule applies to
 |---|---|---|
 | 1 | `identity` | Unknown subject → `deny` `unknown_subject`. Status `suspended` / `closed` → `deny` `subject_suspended` / `subject_closed`. |
 | 2 | `hard_blocks` | Subject flag `fraud` or `legal_hold` → `deny` `fraud_hold` / `legal_hold`. A blocked region → `deny` `region_blocked`. |
-| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in `plans[currentPlan].upgradeTo` / `downgradeTo`; otherwise `deny` `plan_not_permitted`. |
-| 4 | `quota` | If `quantity` is present, per the quota's mode: `hard` above the limit → `deny` `quota_exceeded`; `soft` above the limit → `limit` `quota_warning`; `overage` above the limit → `limit` `overage_billable` (units above the limit). |
-| 5 | `payment_health` | Applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace → `deny` `past_due` with `details.grace_until`. Within grace → `limit` `grace_until`. |
-| 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600), in which case `pass` with reason `verified`. **Timeout:** if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
+| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in `plans[currentPlan].upgradeTo` / `downgradeTo`; otherwise `deny` `plan_not_permitted`. The current plan is the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
+| 4 | `quota` | If `quantity` is present, per the quota's mode, where *above the limit* means `used + quantity > limit`: `hard` → `deny` `quota_exceeded`; `soft` → `limit` `quota_warning`; `overage` → `limit` `overage_billable` with `units = used + quantity − limit`. |
+| 5 | `payment_health` | Applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace (`now > graceUntil`) → `deny` `past_due` with `details.grace_until`. Within grace (`now ≤ graceUntil`) → `limit` `grace_until`. |
+| 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600) and not later than *now* (a future timestamp is not accepted), in which case `pass` with reason `verified`. **Timeout** (no score within `risk.timeoutMs`, default 250): if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
 | 7 | `compliance` | `charge` with `amount > 0` whose region matches an entry in `sca.regions` (default `["EEA", "GB"]`) → `limit` `require_sca`. |
-| 8 | `obligations` | Composes obligations (§5.3). **Plan limits:** an entitlement or plan carrying `limits.maxAmount[currency]` attaches `max_amount`; if the plan sets a `maxAmount` but not for the request's currency → `deny` `currency_not_supported`. |
+| 8 | `obligations` | Composes obligations (§5.3). **Plan limits** (only when `context.amount` is present): a plan carrying `limits.maxAmount[currency]` attaches `max_amount`; if the plan sets a `maxAmount` but not for the request's currency → `deny` `currency_not_supported`. *(Entitlement-level limits were removed by Amendment 2: nothing defined which entitlement governs a charge.)* |
 
 ### 5.2 Final decision
 
 `DENY` if any stage denied · else `REQUIRE_VERIFICATION` if any stage returned `verify` · else
-`ALLOW_WITH_LIMITS` if any obligation exists · else `ALLOW`.
+`ALLOW_WITH_LIMITS` if any obligation exists · else `ALLOW`. A `DENY` carries **no** obligations; a
+`REQUIRE_VERIFICATION` carries those collected before and after the `verify` (Amendment 2).
 
 ### 5.3 Obligation composition
 
 `max_amount`: the **minimum** of all values · `require_sca`: present if any stage requires it ·
-`quota_warning` / `overage_billable` / `grace_until`: at most one each, the most restrictive ·
+`quota_warning` / `overage_billable` / `grace_until`: at most one each, the most restrictive
+(highest `used / limit`; most `units`; earliest date) ·
 obligations are deterministically ordered by `type`.
 
 ### 5.4 Idempotency
@@ -253,8 +269,9 @@ policy sets `ttl.byAction[action]`. `expiresAt = evaluatedAt + ttlSeconds`.
 `INVALID_REQUEST` when: the subject id is empty or the type unknown · the action is unknown ·
 `amount` is not an integer in `0…10^12` · `amount` is present without a valid three-letter
 `currency` · `quantity` is not a non-negative integer · `upgrade` / `downgrade` lacks `plan` ·
-`verification.at` is not a valid ISO-8601 time. **Nothing is evaluated or logged** for an invalid
-request.
+`verification.at` is not a valid ISO-8601 time · `quantity` on an action other than `use_feature:<key>` ·
+an `admin`'s `upgrade` / `downgrade` without a `resource` of type `account`. **Nothing is evaluated
+or logged** for an invalid request.
 
 ### 5.7 Side effects
 
@@ -276,7 +293,7 @@ interface PolicyRules {
   plans: Record<string, { upgradeTo: string[]; downgradeTo: string[]; limits?: { maxAmount?: CurrencyMap } }>;
   blockedRegions: string[];
   premiumActions: ActionKey[];
-  risk: { denyAt: number; verifyAt: number; highValueAmount: CurrencyMap; verificationMaxAgeSeconds: number };
+  risk: { denyAt: number; verifyAt: number; highValueAmount: CurrencyMap; verificationMaxAgeSeconds: number; timeoutMs: number };
   sca: { regions: string[] };
   zones: Record<string, string[]>;   // zone name → ISO-3166 alpha-2 members (zones do not nest)
   ttl: { default: number; byAction?: Partial<Record<ActionKey, number>> };
@@ -290,10 +307,12 @@ interface PolicyRules {
 |---|---|
 | `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user |
 | `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500, ZAR: 45000 }` ($25 and equivalents; R 450) |
-| `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` |
+| `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` · `timeoutMs 250` |
 | `premiumActions` | `upgrade`, `use_feature:*` |
 | `sca.regions` | `["EEA", "GB"]` (PSD2 across the EEA, plus the UK) |
 | `zones` | `EU`: AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU, IE, IT, LV, LT, LU, MT, NL, PL, PT, RO, SK, SI, ES, SE · `EEA`: the EU members plus IS, LI, NO |
+| `blockedRegions` | `[]` |
+| `plans` | `{}` (deployments and the tests publish their own) |
 | `ttl.default` | 300 |
 | `idempotency.windowSeconds` | 86 400 |
 
@@ -301,9 +320,10 @@ Like every threshold, the ZAR amounts are policy data, reviewed periodically as 
 
 - `publish(version)` makes a version **immutable**: its content hash is recorded, and publishing
   the same version identifier with different content fails `POLICY_IMMUTABLE`.
-- The **active** version is the latest published version whose `effectiveAt ≤ now`.
-- `rollback(toVersion)` re-activates an earlier published version. It is recorded, not destructive:
-  no version is ever deleted.
+- The store keeps an **activation history**: `publish(v)` adds an activation at `v.effectiveAt`;
+  `rollback(toVersion)` adds one at *now*. **The active version is the one named by the latest
+  activation at or before now** (Amendment 2; this reconciles publish and rollback).
+- Rollback is recorded, not destructive: no version is ever deleted.
 - Every decision records the `policyVersion` it was evaluated under.
 - **No evaluation without a policy:** if no version is active, `authorize` throws `NO_ACTIVE_POLICY`.
 
@@ -315,10 +335,12 @@ Every decision (including batch items and idempotent replays marked `replay: tru
 interface DecisionRecord {
   decisionId: string; at: string;
   subject: SubjectRef; action: Action; resource?: ResourceRef;
-  inputsHash: string;         // SHA-256 of the canonical JSON of the request, excluding idempotencyKey
+  inputsHash: string;         // SHA-256 of the canonical JSON (keys sorted at every level, no whitespace,
+                              // undefined omitted) of the request, excluding idempotencyKey
   policyVersion: string;
   decision: DecisionKind; obligations: Obligation[]; reasonCodes: string[];
-  latencyMs: number; replay?: true;
+  latencyMs: number;          // a monotonic timer, never the injected clock
+  replay?: true;
 }
 ```
 
@@ -341,7 +363,7 @@ interface DecisionRecord {
 · `NO_ACTIVE_POLICY` (503) · `POLICY_IMMUTABLE` (409) · `DECISION_LOG_UNAVAILABLE` (503).
 HTTP bodies: `{ "error": { "code": "...", "message": "...", "details": { ... } } }`.
 
-**Batches** are validated as a whole before anything runs: if any item is invalid, or two items
+**Batches** read the clock **once**: every item shares that `evaluatedAt`. They are validated as a whole before anything runs: if any item is invalid, or two items
 share an `idempotencyKey`, the whole batch fails `INVALID_REQUEST` (with the offending indexes in
 `details`), and **nothing is evaluated or logged**.
 
@@ -361,12 +383,19 @@ logs `billing-authz-api running on port <PORT>` (the engine's API smoke test wai
 port"). Caller authentication and resource ownership are out of this slice (§3.4), and the README
 says so plainly.
 
+**Deployment target:** *to be decided by the founder* (Amendment 2, G-29); a "working system"
+cannot be claimed without it. **Availability:** not measured in this slice (G-28).
+
 ## 11. Acceptance tests
 
 Each test's name starts with its ID (`AT-01 …`), so evidence can be traced to this list. All run
-from a clean clone with in-memory adapters, a fixed clock, and the default policy of §6 published as
-version `2026-09-01`. Unless stated otherwise, the account `acct_123` is active, in region `EU`, on a
-plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
+from a clean clone with in-memory adapters, the fixed clock `2026-09-26T12:00:00Z`, and the default
+policy of §6 published as version `2026-09-01` (effective `2026-09-01T00:00:00Z`) with two plans:
+`starter` (`upgradeTo: ["pro"]`, `limits.maxAmount: { USD: 5000, EUR: 5000, GBP: 5000, ZAR: 90000 }`)
+and `pro` (`downgradeTo: ["starter"]`). Unless stated otherwise, the account `acct_123` is active, in
+region `EU`, on `starter`, with payment state `active` and an entitlement to `advanced_export`; risk is
+low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin_support` (role
+`support_agent`) and `admin_finance` (role `finance`), all active (Amendment 2).
 
 **Core (`billing-authz`)**
 
@@ -386,7 +415,7 @@ plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
 | AT-12 | `upgrade` to a plan not listed | `DENY` · `plan_not_permitted` |
 | AT-13 | Account `past_due`, grace ended; `upgrade` | `DENY` · `past_due` with `details.grace_until` (blueprint 6.4) |
 | AT-14 | Account `past_due`, within grace; `upgrade` | `ALLOW_WITH_LIMITS` with `grace_until` |
-| AT-15 | Account `past_due`, grace ended; `charge` by a service (dunning retry) | **not** denied by `payment_health` |
+| AT-15 | Account `past_due`, grace ended; **the account itself** makes a `charge` (dunning must stay possible) | **not** denied by `payment_health`: the decision comes from the later stages |
 | AT-16 | Unknown subject | `DENY` · `unknown_subject` |
 | AT-17 | Suspended subject; closed subject | `DENY` · `subject_suspended`; `DENY` · `subject_closed` |
 | AT-18 | Subject flagged `fraud` | `DENY` · `fraud_hold` at `hard_blocks`; **no later stage is called** (spies) |
@@ -402,8 +431,8 @@ plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
 | AT-28 | Risk source times out; `charge` 1 000 USD | `ALLOW_WITH_LIMITS` · `risk_unchecked` (fail-open) |
 | AT-29 | Risk source times out; amount in a currency with no `highValueAmount` | `DENY` · `risk_unavailable` (fail-closed) |
 | AT-30 | `charge` in region `US`; `charge` with no `context.region` by an account whose home region is `EU` | no `require_sca`; `require_sca` |
-| AT-31 | Two stages attach `max_amount` 5 000 and 3 000 | one `max_amount` = 3 000 |
-| AT-32 | `charge` 4 900 **EUR** on a plan whose `maxAmount` lists only USD | `DENY` · `currency_not_supported` |
+| AT-31 | *(component test of §5.3)* obligations `max_amount` 5 000 and 3 000 are composed | one `max_amount` = 3 000 |
+| AT-32 | `charge` 4 900 **CHF** (a currency the plan's `maxAmount` does not list) | `DENY` · `currency_not_supported` |
 | AT-33 | Same `idempotencyKey`, same inputs, twice | identical `decisionId`, `evaluatedAt` and `expiresAt`; second response `replay: true`; second log record `replay` |
 | AT-34 | The same replay after the original's `expiresAt` | returned unchanged, with `expiresAt` in the past (detectably expired) |
 | AT-35 | Same `idempotencyKey`, different amount | `IDEMPOTENCY_CONFLICT` |
@@ -423,7 +452,7 @@ plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
 
 | ID | Given / When | Then |
 |---|---|---|
-| AT-47 | `POST /v1/authorize` with the blueprint's **exact example request** | 200 and the blueprint's example response: `decision` `ALLOW_WITH_LIMITS`, `obligations` `[max_amount 5000, require_sca true]`, `policy_version` `2026-09-01`, `ttl_seconds` 300, plus `decision_id` and `expires_at` |
+| AT-47 | `POST /v1/authorize` with `{ "subject": { "type": "account", "id": "acct_123" }, "action": "charge", "resource": { "type": "invoice", "id": "inv_456" }, "context": { "amount": 4900, "currency": "USD" } }` (the blueprint's example request) | 200 and the blueprint's example response: `decision` `ALLOW_WITH_LIMITS`, `obligations` `[max_amount 5000, require_sca true]`, `policy_version` `2026-09-01`, `ttl_seconds` 300, plus `decision_id` and `expires_at` |
 | AT-48 | `GET /health` | 200 `{ "status": "ok" }` |
 | AT-49 | Malformed body | 400 `INVALID_REQUEST` |
 | AT-50 | Idempotency conflict over HTTP | 409 `IDEMPOTENCY_CONFLICT` |
@@ -437,7 +466,7 @@ plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
 |---|---|---|
 | AT-54 | `charge` 4 900 EUR with `context.region` `"DE"` | `require_sca` (DE ∈ EEA) |
 | AT-55 | `charge` 4 900 GBP with `context.region` `"GB"` | `require_sca` |
-| AT-56 | `charge` with `context.region` `"IS"` (EEA, not EU) | `require_sca`; and `"US"` → none |
+| AT-56 | `charge` 1 000 USD with `context.region` `"IS"` (EEA, not EU) | `require_sca`; and `"US"` → none |
 | AT-57 | `refund` 40 000 ZAR by `support_agent`; then 50 000 ZAR | `ALLOW`; then `DENY` · `role_required` |
 | AT-58 | Risk source times out; `charge` 150 000 ZAR; then 200 000 ZAR | `ALLOW_WITH_LIMITS` · `risk_unchecked`; then `DENY` · `risk_unavailable` |
 | AT-59 | Policy zone `SANCTIONED = ["KP"]`, `blockedRegions` `["SANCTIONED"]`; request from `"KP"`; subject whose home region is `"KP"` | `DENY` · `region_blocked` for both |
