@@ -1,4 +1,9 @@
-# billing-authz — Specification v1.0
+# billing-authz — Specification v1.1
+
+> **Amendment 1 (2026-09-26, AE-D36):** policy zones with a defined matching rule; SCA across the
+> EEA plus the UK; the rand (ZAR) as a first-class currency; AT-54…AT-60. The founding version
+> (v1.0, SHA-256 `c729147529fe89f3…`) is the one the pipeline ledger witnesses, in this repo's
+> first commit; this amendment is recorded in lineage as `CHANGE_MERGED` with its new hash.
 
 > **Frozen 2026-09-26 (Revision 2).** The founding specification of the pipeline repos
 > `billing-authz` and `billing-authz-api`. Its SHA-256 (canonical form: UTF-8, LF line endings)
@@ -100,7 +105,7 @@ interface Verification {
 interface Context {
   amount?: number;            // minor units: an integer, 0 ≤ amount ≤ 10^12
   currency?: string;          // ISO-4217 (three capital letters), required when amount is present
-  region?: string;            // ISO-3166 alpha-2 or a policy-defined zone such as "EU"
+  region?: string;            // ISO-3166 alpha-2 or a zone defined in the policy's `zones` (§6), such as "EU"
   quantity?: number;          // metered units requested (quota): an integer ≥ 0
   plan?: string;              // target plan: required for upgrade and downgrade
   verification?: Verification;
@@ -195,8 +200,17 @@ plus reasons. **A `deny` stops the pipeline immediately**: later stages, includi
 calls, do not run.
 
 **Regions:** a region is **blocked** if either the request's `context.region` or the subject's home
-region is in `blockedRegions`. Where a rule needs *the* region (SCA), it uses `context.region`,
-falling back to the subject's home region.
+region matches an entry in `blockedRegions`. Where a rule needs *the* region (SCA), it uses
+`context.region`, falling back to the subject's home region.
+
+**Matching (Amendment 1):** a region *matches* a listed entry when
+1. they are equal; or
+2. the entry is a zone (a key of `zones`, §6) that contains the region; or
+3. the region is itself a zone and **every** member of it matches the entry by rule 1 or 2
+   (so `"EU"` matches `"EEA"`, because every EU member is in the EEA).
+
+Zones contain only ISO-3166 alpha-2 codes; they do not nest. The rule applies to
+`blockedRegions` and `sca.regions`, for both the request's region and the subject's home region.
 
 | # | Stage | Rules in this slice (thresholds come from the active policy, §6) |
 |---|---|---|
@@ -206,7 +220,7 @@ falling back to the subject's home region.
 | 4 | `quota` | If `quantity` is present, per the quota's mode: `hard` above the limit → `deny` `quota_exceeded`; `soft` above the limit → `limit` `quota_warning`; `overage` above the limit → `limit` `overage_billable` (units above the limit). |
 | 5 | `payment_health` | Applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace → `deny` `past_due` with `details.grace_until`. Within grace → `limit` `grace_until`. |
 | 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600), in which case `pass` with reason `verified`. **Timeout:** if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
-| 7 | `compliance` | `charge` with `amount > 0` whose region is in `sca.regions` (default `["EU"]`) → `limit` `require_sca`. |
+| 7 | `compliance` | `charge` with `amount > 0` whose region matches an entry in `sca.regions` (default `["EEA", "GB"]`) → `limit` `require_sca`. |
 | 8 | `obligations` | Composes obligations (§5.3). **Plan limits:** an entitlement or plan carrying `limits.maxAmount[currency]` attaches `max_amount`; if the plan sets a `maxAmount` but not for the request's currency → `deny` `currency_not_supported`. |
 
 ### 5.2 Final decision
@@ -264,6 +278,7 @@ interface PolicyRules {
   premiumActions: ActionKey[];
   risk: { denyAt: number; verifyAt: number; highValueAmount: CurrencyMap; verificationMaxAgeSeconds: number };
   sca: { regions: string[] };
+  zones: Record<string, string[]>;   // zone name → ISO-3166 alpha-2 members (zones do not nest)
   ttl: { default: number; byAction?: Partial<Record<ActionKey, number>> };
   idempotency: { windowSeconds: number };
 }
@@ -274,12 +289,15 @@ interface PolicyRules {
 | Rule | Default |
 |---|---|
 | `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user |
-| `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500 }` ($25 and equivalents) |
-| `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000 }` · `verificationMaxAgeSeconds 600` |
+| `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500, ZAR: 45000 }` ($25 and equivalents; R 450) |
+| `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` |
 | `premiumActions` | `upgrade`, `use_feature:*` |
-| `sca.regions` | `["EU"]` |
+| `sca.regions` | `["EEA", "GB"]` (PSD2 across the EEA, plus the UK) |
+| `zones` | `EU`: AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU, IE, IT, LV, LT, LU, MT, NL, PL, PT, RO, SK, SI, ES, SE · `EEA`: the EU members plus IS, LI, NO |
 | `ttl.default` | 300 |
 | `idempotency.windowSeconds` | 86 400 |
+
+Like every threshold, the ZAR amounts are policy data, reviewed periodically as exchange rates drift.
 
 - `publish(version)` makes a version **immutable**: its content hash is recorded, and publishing
   the same version identifier with different content fails `POLICY_IMMUTABLE`.
@@ -413,6 +431,21 @@ plan whose `limits.maxAmount` is `{ USD: 5000 }`, with low risk (score 10).
 | AT-52 | `GET /v1/policies/active` | 200 `{ "version": "2026-09-01", "effective_at": … }` |
 | AT-53 | The service's decisions come from `billing-authz` (imported, not reimplemented) | a spy on the core's `authorize` is called by the handler |
 
+**Amendment 1** (core, `billing-authz`):
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-54 | `charge` 4 900 EUR with `context.region` `"DE"` | `require_sca` (DE ∈ EEA) |
+| AT-55 | `charge` 4 900 GBP with `context.region` `"GB"` | `require_sca` |
+| AT-56 | `charge` with `context.region` `"IS"` (EEA, not EU) | `require_sca`; and `"US"` → none |
+| AT-57 | `refund` 40 000 ZAR by `support_agent`; then 50 000 ZAR | `ALLOW`; then `DENY` · `role_required` |
+| AT-58 | Risk source times out; `charge` 150 000 ZAR; then 200 000 ZAR | `ALLOW_WITH_LIMITS` · `risk_unchecked`; then `DENY` · `risk_unavailable` |
+| AT-59 | Policy zone `SANCTIONED = ["KP"]`, `blockedRegions` `["SANCTIONED"]`; request from `"KP"`; subject whose home region is `"KP"` | `DENY` · `region_blocked` for both |
+| AT-60 | A subject with home region `"FR"`, no `context.region`; `charge` > 0 | `require_sca` (home-region fallback through the zone) |
+
+AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
+`"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
+
 ## 12. RMM evidence plan
 
 Provenance for both repos: **`pipeline`**, witnessed by one ledger entry each, recorded **before**
@@ -422,7 +455,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-53 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-60 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -434,6 +467,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 53 acceptance tests pass locally and in CI; CI builds and tests.
+2. All 60 acceptance tests (53 founding + 7 from Amendment 1) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
