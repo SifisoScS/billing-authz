@@ -1,0 +1,29 @@
+{
+  "system": "billing",
+  "role": "module",
+  "related": [
+    "billing-auth",
+    "billing-worker",
+    "invoice-parser",
+    "payment-gateway",
+    "billing-webhooks",
+    "billing-analytics",
+    "billing-cli",
+    "billing-slack",
+    "billing-email",
+    "billing-discord",
+    "billing-whatsapp",
+    "billing-notion",
+    "billing-github",
+    "billing-webhook",
+    "billing-stripe",
+    "billing-zapier",
+    "billing-teams"
+  ],
+  "provenance": "pipeline",
+  "spec": {
+    "path": "SPEC.md",
+    "sha256": "c729147529fe89f3a7b3bc0409763a09d650af52765605457db2b9fd6c9d7678",
+    "ledgerRecordedAt": "2026-09-26T08:10:15.330Z"
+  }
+}
