@@ -1,4 +1,8 @@
-# billing-authz — Specification v1.2
+# billing-authz — Specification v1.3
+
+> **Amendment 3 (2026-09-27):** three acceptance tests (AT-61…AT-63) for rules no test checked.
+> Found by the engine's mutation check: changing the final-decision precedence, the TTL, or the
+> grace boundary left every existing test green. No rule changes.
 
 > **Amendment 2 (2026-09-26):** makes the specification internally consistent, as found by its
 > translation into a Blueprint (Repository Engine 1000, `blueprints/billing-authz.TRANSLATION.md`):
@@ -472,6 +476,14 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin
 | AT-59 | Policy zone `SANCTIONED = ["KP"]`, `blockedRegions` `["SANCTIONED"]`; request from `"KP"`; subject whose home region is `"KP"` | `DENY` · `region_blocked` for both |
 | AT-60 | A subject with home region `"FR"`, no `context.region`; `charge` > 0 | `require_sca` (home-region fallback through the zone) |
 
+**Amendment 3** (core, `billing-authz`): rules that no earlier test could catch changing.
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-61 | Risk score 60 (→ `verify`) on a `charge` of 4 900 **CHF**, a currency the plan's `maxAmount` does not list (→ `deny` at `obligations`) | `DENY` · `currency_not_supported`, with no obligations: a deny outranks a verify (§5.2) |
+| AT-62 | A `charge` of 1 000 USD; then the same with the policy's `ttl.byAction.charge` = 60 | `ttlSeconds` 300 and `expiresAt` = `evaluatedAt` + 300 s; then `ttlSeconds` 60 (§5.5) |
+| AT-63 | Account `past_due` with `graceUntil` **equal to** *now*; `upgrade` | `ALLOW_WITH_LIMITS` with `grace_until`: the boundary is still within grace (§5.1, stage 5) |
+
 AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
 `"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
 
@@ -484,7 +496,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-60 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-63 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -496,6 +508,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 60 acceptance tests (53 founding + 7 from Amendment 1) pass locally and in CI; CI builds and tests.
+2. All 63 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
