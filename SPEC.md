@@ -1,4 +1,9 @@
-# billing-authz — Specification v1.3
+# billing-authz — Specification v1.4
+
+> **Amendment 5 (2026-09-27):** the plan leaves the Subject record. A plan is subscription data,
+> not identity (founder decision, Production Truth Map): **billing-auth** answers *who you are*,
+> **billing-core** answers *what subscription you have*, billing-authz decides *what you may do*.
+> The plan is now read through its own port, `PlanSource`. No decision changes; the 63 tests stand.
 
 > **Amendment 3 (2026-09-27):** three acceptance tests (AT-61…AT-63) for rules no test checked.
 > Found by the engine's mutation check: changing the final-decision precedence, the TTL, or the
@@ -165,6 +170,7 @@ interface EngineDeps {
   entitlements: EntitlementSource;
   quotas: QuotaSource;
   payments: PaymentHealthSource;
+  plans: PlanSource;                // Amendment 5
   risk: RiskSource;
   policies: PolicyStore;
   log: DecisionLog;
@@ -192,7 +198,8 @@ action?* — plans and entitlements for customers, roles for operators.)
 | Port | Question it answers | In-memory adapter |
 |---|---|---|
 | `Clock` | What time is it? | `fixedClock(iso)`, `systemClock()` |
-| `SubjectSource` | Who is this subject: status, home region, roles, flags, current plan? | `InMemorySubjects` |
+| `SubjectSource` | Who is this subject: status, home region, roles, flags? | `InMemorySubjects` |
+| `PlanSource` | Which plan is this subject (or resource account) on? *(Amendment 5)* | `InMemoryPlans` |
 | `EntitlementSource` | Which features does the subject hold, valid when, with which limits? | `InMemoryEntitlements` |
 | `QuotaSource` | Current usage, limit and mode (`soft` / `hard` / `overage`) per quota. **Read-only.** | `InMemoryQuotas` |
 | `PaymentHealthSource` | Subscription/payment state: active, past_due, and the grace deadline | `InMemoryPaymentHealth` |
@@ -202,8 +209,9 @@ action?* — plans and entitlements for customers, roles for operators.)
 | `IdempotencyStore` | Decisions by idempotency key | `InMemoryIdempotencyStore` |
 
 **Records the ports return (Amendment 2):**
-- **Subject:** `{ type, status: "active" | "suspended" | "closed", homeRegion?, roles: string[], flags: ("fraud" | "legal_hold")[], plan? }`.
+- **Subject:** `{ type, status: "active" | "suspended" | "closed", homeRegion?, roles: string[], flags: ("fraud" | "legal_hold")[] }`.
   A `user`'s entitlements, plan and payment state are its **own** records (no account inheritance in this slice).
+- **Plan** *(Amendment 5)*: `{ plan }`, from `PlanSource`, keyed by the subject (or, for an `admin`, the resource account).
 - **Entitlement:** `{ feature, validFrom?, validUntil? }`, valid at *now* when `validFrom ≤ now < validUntil`; a missing bound is open.
 - **Quota:** `{ key, used, limit, mode }`. A request's quota is the one keyed by the **feature** of `use_feature:<key>`.
 - **PaymentHealth:** `{ state: "active" | "past_due", graceUntil? }`.
@@ -234,7 +242,7 @@ Zones contain only ISO-3166 alpha-2 codes; they do not nest. The rule applies to
 |---|---|---|
 | 1 | `identity` | Unknown subject → `deny` `unknown_subject`. Status `suspended` / `closed` → `deny` `subject_suspended` / `subject_closed`. |
 | 2 | `hard_blocks` | Subject flag `fraud` or `legal_hold` → `deny` `fraud_hold` / `legal_hold`. A blocked region → `deny` `region_blocked`. |
-| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in `plans[currentPlan].upgradeTo` / `downgradeTo`; otherwise `deny` `plan_not_permitted`. The current plan is the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
+| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in `plans[currentPlan].upgradeTo` / `downgradeTo`; otherwise `deny` `plan_not_permitted`. The current plan is read from `PlanSource` (Amendment 5): the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
 | 4 | `quota` | If `quantity` is present, per the quota's mode, where *above the limit* means `used + quantity > limit`: `hard` → `deny` `quota_exceeded`; `soft` → `limit` `quota_warning`; `overage` → `limit` `overage_billable` with `units = used + quantity − limit`. |
 | 5 | `payment_health` | Applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace (`now > graceUntil`) → `deny` `past_due` with `details.grace_until`. Within grace (`now ≤ graceUntil`) → `limit` `grace_until`. |
 | 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600) and not later than *now* (a future timestamp is not accepted), in which case `pass` with reason `verified`. **Timeout** (no score within `risk.timeoutMs`, default 250): if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
@@ -397,7 +405,7 @@ from a clean clone with in-memory adapters, the fixed clock `2026-09-26T12:00:00
 policy of §6 published as version `2026-09-01` (effective `2026-09-01T00:00:00Z`) with two plans:
 `starter` (`upgradeTo: ["pro"]`, `limits.maxAmount: { USD: 5000, EUR: 5000, GBP: 5000, ZAR: 90000 }`)
 and `pro` (`downgradeTo: ["starter"]`). Unless stated otherwise, the account `acct_123` is active, in
-region `EU`, on `starter`, with payment state `active` and an entitlement to `advanced_export`; risk is
+region `EU`, on `starter` (from the plan source), with payment state `active` and an entitlement to `advanced_export`; risk is
 low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin_support` (role
 `support_agent`) and `admin_finance` (role `finance`), all active (Amendment 2).
 
