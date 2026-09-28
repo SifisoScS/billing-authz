@@ -565,7 +565,7 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin
 
 | ID | Given / When | Then |
 |---|---|---|
-| AT-74 | `charge` 4 900 USD | the `proof` verifies with the public key, not with another key, and with a list holding another key and the right one (rotation); it signs exactly the nine fields, and each signed field the decision also carries is equal |
+| AT-74 | `charge` 4 900 USD on `inv_456` | the `proof` verifies with the public key, not with another key, and with a list holding another key and the right one (rotation); it signs exactly the nine fields; each signed field the decision also carries is equal; and the signed `subject`, `action` and `resource` are **this request's** (the signature cannot cover another request) |
 | AT-75 | The same, with `proof.signed.obligations[0].value` changed to 50 000 | the altered proof does not verify |
 | AT-76 | The same request twice with one `idempotencyKey` | the replay carries the identical `proof`, which still verifies |
 | AT-77 | `POST /v1/authorize` (AT-47's request) | 200, and the `proof` received over HTTP verifies |
