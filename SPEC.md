@@ -1,4 +1,22 @@
-# billing-authz — Specification v1.5
+# billing-authz — Specification v1.6
+
+> **Amendment 8 (2026-09-28): signed decisions.** billing-core executes a billing change only with
+> a billing-authz decision (billing-core BC-19, BC-23), and an unsigned decision could be forged
+> (BC-25). **Every decision now carries a `proof`**: an **Ed25519** signature over
+> `decisionId, subject, action, resource, inputsHash, decision, obligations, policyVersion,
+> expiresAt`. billing-authz holds the private key, its first secret; verifiers accept the
+> **current and previous** public keys for **30 days** after a rotation. A replay returns the
+> original proof. **Not decided yet:** how the public keys are published (G-31). AT-74…AT-77.
+
+> **Amendment 7 (2026-09-28): a cancelled subscription, and three new actions.** *"A cancelled
+> account is restricted, not nonexistent."* A payment state **`canceled`** (billing-core reports a
+> cancelled payment or an ended subscription this way; an account `closed` is unchanged, AT-17)
+> denies `charge`, `upgrade`, `downgrade` and `use_feature:*` with `subscription_canceled`;
+> `cancel` stays allowed (a cancelled thing is already cancelled), refunds and credits keep their
+> rules. New actions: **`settlement_charge`** (collect existing debt: services and `billing_admin`),
+> **`reactivate`** (`customer_owner`, `billing_admin`, `support_manager`) and **`invite_member`**
+> (`customer_owner`, `billing_operator`; billing-core BC-18). Invoice actions wait for invoices.
+> AT-64…AT-73.
 
 > **Amendment 6 (2026-09-27):** the **plan catalogue** (which plans exist, their upgrade and
 > downgrade paths, their spending limits) moves to **billing-core**, which owns plans (founder
@@ -75,6 +93,8 @@ the pilot's RMM-4 path.
 - An append-only decision log (§7) and idempotency (§5.4).
 - Every external dependency behind a **port** (§4.4), with an **in-memory adapter** shipped.
 - An injectable clock: no evaluator reads the system time directly.
+- **Signed decisions** (Amendment 8): every decision carries an Ed25519 `proof` that a verifier can
+  check with billing-authz's public key, without calling billing-authz.
 
 ### 3.2 Deferred to later phases (blueprint Phases 2–3; ports exist, adapters don't)
 
@@ -96,6 +116,11 @@ verifies credentials — that is `billing-auth`'s job, a different repo) · stor
 - **Resource ownership is the caller's responsibility.** This slice does not check that a
   `resource` belongs to the `subject`; for example, an account asking about another account's
   invoice is not detected. The README states this plainly.
+- **A customer role is not checked against its account** (Amendment 7). `customer_owner` belongs to
+  one account and may act only on it, but that link is owned by billing-core, and billing-authz does
+  not check it in v1: the caller remains responsible, as for resources.
+- **"Existing debt only" is the settling service's rule** (Amendment 7). billing-authz decides who
+  may make a `settlement_charge`; it does not know balances (none exist in v1).
 - **Verification evidence is trusted as supplied.** `context.verification` (§4.1) is the caller's
   assertion that a step-up or SCA happened; billing-authz checks its age, not its authenticity.
 
@@ -113,7 +138,8 @@ interface SubjectRef { type: SubjectType; id: string }
 
 type Action =
   | "charge" | "refund" | "credit" | "upgrade" | "downgrade" | "cancel"
-  | `use_feature:${string}`;
+  | `use_feature:${string}`
+  | "settlement_charge" | "reactivate" | "invite_member";      // Amendment 7
 
 interface ResourceRef { type: "account" | "subscription" | "invoice" | "seat"; id: string }
 
@@ -164,8 +190,23 @@ interface Decision {
   evaluatedAt: string;       // ISO-8601, from the injected clock
   expiresAt: string;         // evaluatedAt + ttlSeconds; a caller must not act on a decision after this
   replay?: true;             // present when returned from the idempotency store (§5.4)
+  proof: Proof;              // Amendment 8
+}
+
+interface Proof {
+  alg: "Ed25519";
+  signed: {                  // exactly these nine fields, signed in canonical JSON (§7's form)
+    decisionId: string; subject: SubjectRef; action: Action; resource?: ResourceRef;
+    inputsHash: string; decision: DecisionKind; obligations: Obligation[];
+    policyVersion: string; expiresAt: string;
+  };
+  signature: string;         // base64 Ed25519 signature over the canonical JSON of `signed`
 }
 ```
+
+A verifier (billing-core) checks the signature with billing-authz's public key and then trusts the
+**signed** fields only. `verifyProof(proof, publicKeys)` accepts a list, so the current and the
+previous key both verify during the 30-day rotation window.
 
 ### 4.2 Engine
 
@@ -181,6 +222,7 @@ interface EngineDeps {
   policies: PolicyStore;
   log: DecisionLog;
   idempotency?: IdempotencyStore;   // defaults to in-memory
+  signingKey: PrivateKey;           // Amendment 8: Ed25519; required, never defaulted
 }
 
 function createEngine(deps: EngineDeps): {
@@ -213,6 +255,7 @@ action?* — plans and entitlements for customers, roles for operators.)
 | `PolicyStore` | Versioned policy data (§6) | `InMemoryPolicyStore` |
 | `DecisionLog` | Append-only record of decisions (§7) | `InMemoryDecisionLog` |
 | `IdempotencyStore` | Decisions by idempotency key | `InMemoryIdempotencyStore` |
+| *signing key* | billing-authz's Ed25519 private key (Amendment 8; not a port: a secret from configuration) | a key pair generated by the tests |
 
 **Records the ports return (Amendment 2):**
 - **Subject:** `{ type, status: "active" | "suspended" | "closed", homeRegion?, roles: string[], flags: ("fraud" | "legal_hold")[] }`.
@@ -220,7 +263,8 @@ action?* — plans and entitlements for customers, roles for operators.)
 - **Plan** *(Amendments 5 and 6)*: `{ plan, upgradeTo: string[], downgradeTo: string[], limits?: { maxAmount?: CurrencyMap } }`, from `PlanSource`, keyed by the subject (or, for an `admin`, the resource account): the account's current plan with its entry in billing-core's plan catalogue.
 - **Entitlement:** `{ feature, validFrom?, validUntil? }`, valid at *now* when `validFrom ≤ now < validUntil`; a missing bound is open.
 - **Quota:** `{ key, used, limit, mode }`. A request's quota is the one keyed by the **feature** of `use_feature:<key>`.
-- **PaymentHealth:** `{ state: "active" | "past_due", graceUntil? }`.
+- **PaymentHealth:** `{ state: "active" | "past_due" | "canceled", graceUntil? }`. `canceled`
+  (Amendment 7): a cancelled payment, or an ended subscription, as billing-core reports it.
 
 ## 5. Decision semantics
 
@@ -250,7 +294,7 @@ Zones contain only ISO-3166 alpha-2 codes; they do not nest. The rule applies to
 | 2 | `hard_blocks` | Subject flag `fraud` or `legal_hold` → `deny` `fraud_hold` / `legal_hold`. A blocked region → `deny` `region_blocked`. |
 | 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in the current plan's `upgradeTo` / `downgradeTo` (Amendment 6); otherwise `deny` `plan_not_permitted`. The current plan is read from `PlanSource` (Amendment 5): the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
 | 4 | `quota` | If `quantity` is present, per the quota's mode, where *above the limit* means `used + quantity > limit`: `hard` → `deny` `quota_exceeded`; `soft` → `limit` `quota_warning`; `overage` → `limit` `overage_billable` with `units = used + quantity − limit`. |
-| 5 | `payment_health` | Applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace (`now > graceUntil`) → `deny` `past_due` with `details.grace_until`. Within grace (`now ≤ graceUntil`) → `limit` `grace_until`. |
+| 5 | `payment_health` | **Cancelled** (Amendment 7): payment state `canceled` and the action in the policy's `cancelledDenies` (default `charge`, `upgrade`, `downgrade`, every `use_feature:*`) → `deny` `subscription_canceled`. **Past due** applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace (`now > graceUntil`) → `deny` `past_due` with `details.grace_until`. Within grace (`now ≤ graceUntil`) → `limit` `grace_until`. |
 | 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600) and not later than *now* (a future timestamp is not accepted), in which case `pass` with reason `verified`. **Timeout** (no score within `risk.timeoutMs`, default 250): if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
 | 7 | `compliance` | `charge` with `amount > 0` whose region matches an entry in `sca.regions` (default `["EEA", "GB"]`) → `limit` `require_sca`. |
 | 8 | `obligations` | Composes obligations (§5.3). **Plan limits** (only when `context.amount` is present): a current plan carrying `limits.maxAmount[currency]` attaches `max_amount`; if the plan sets a `maxAmount` but not for the request's currency → `deny` `currency_not_supported`. *(Entitlement-level limits were removed by Amendment 2: nothing defined which entitlement governs a charge.)* |
@@ -310,6 +354,7 @@ interface PolicyRules {
   operator: { financeThreshold: CurrencyMap };
   blockedRegions: string[];
   premiumActions: ActionKey[];
+  cancelledDenies: ActionKey[];      // Amendment 7
   risk: { denyAt: number; verifyAt: number; highValueAmount: CurrencyMap; verificationMaxAgeSeconds: number; timeoutMs: number };
   sca: { regions: string[] };
   zones: Record<string, string[]>;   // zone name → ISO-3166 alpha-2 members (zones do not nest)
@@ -322,10 +367,11 @@ interface PolicyRules {
 
 | Rule | Default |
 |---|---|
-| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user |
+| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user · **Amendment 7:** `settlement_charge`: service; admin with `billing_admin` · `reactivate`: user or admin with `customer_owner`, `billing_admin` or `support_manager` · `invite_member`: user or admin with `customer_owner` or `billing_operator` |
 | `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500, ZAR: 45000 }` ($25 and equivalents; R 450) |
 | `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` · `timeoutMs 250` |
 | `premiumActions` | `upgrade`, `use_feature:*` |
+| `cancelledDenies` | `charge`, `upgrade`, `downgrade`, `use_feature:*` (Amendment 7) |
 | `sca.regions` | `["EEA", "GB"]` (PSD2 across the EEA, plus the UK) |
 | `zones` | `EU`: AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU, IE, IT, LV, LT, LU, MT, NL, PL, PT, RO, SK, SI, ES, SE · `EEA`: the EU members plus IS, LI, NO |
 | `blockedRegions` | `[]` |
@@ -394,7 +440,9 @@ share an `idempotencyKey`, the whole batch fails `INVALID_REQUEST` (with the off
 
 Wire format follows the blueprint (`idempotency_key`, `policy_version`, `decision_id`,
 `ttl_seconds`, plus `expires_at`). Configuration from environment variables (`PORT`, default 3000;
-`HOST`, default `localhost`; `POLICY_FILE`); **no secret has a default value**. On start the service
+`HOST`, default `localhost`; `POLICY_FILE`; `SIGNING_KEY_FILE`, the path of the Ed25519 private
+key in PEM, Amendment 8); **no secret has a default value**: without a signing key the service does
+not start. The `proof` crosses the wire **unchanged** (its field names are the signed ones). On start the service
 logs `billing-authz-api running on port <PORT>` (the engine's API smoke test waits for "running on
 port"). Caller authentication and resource ownership are out of this slice (§3.4), and the README
 says so plainly.
@@ -496,6 +544,32 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin
 | AT-62 | A `charge` of 1 000 USD; then the same with the policy's `ttl.byAction.charge` = 60 | `ttlSeconds` 300 and `expiresAt` = `evaluatedAt` + 300 s; then `ttlSeconds` 60 (§5.5) |
 | AT-63 | Account `past_due` with `graceUntil` **equal to** *now*; `upgrade` | `ALLOW_WITH_LIMITS` with `grace_until`: the boundary is still within grace (§5.1, stage 5) |
 
+**Amendment 7** (core, `billing-authz`). New fixture subjects: `owner_1` (user, role
+`customer_owner`), `admin_billing` (admin, `billing_admin`), `admin_ops` (admin,
+`billing_operator`) and `svc_dunning` (service).
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-64 | Payment state `canceled`; `charge` 1 000 USD | `DENY` · `subscription_canceled` at `payment_health` |
+| AT-65 | Payment state `canceled`; `upgrade` to `pro` | `DENY` · `subscription_canceled` |
+| AT-66 | Payment state `canceled`; `downgrade` to a listed plan | `DENY` · `subscription_canceled` |
+| AT-67 | Payment state `canceled`; `cancel` | `ALLOW` (idempotent: already cancelled) |
+| AT-68 | Payment state `canceled`; `use_feature:advanced_export` | `DENY` · `subscription_canceled` |
+| AT-69 | `settlement_charge` 1 000 USD by `svc_dunning`; by `admin_billing` | `ALLOW`; `ALLOW` |
+| AT-70 | `settlement_charge` by `admin_support`; by `owner_1` | `DENY` · `not_permitted` for both |
+| AT-71 | `reactivate` by `owner_1`; by `admin_billing`; by `user_1` (no role) | `ALLOW`; `ALLOW`; `DENY` · `not_permitted` |
+| AT-72 | `invite_member` by `owner_1`; by `admin_ops`; by `admin_support` | `ALLOW`; `ALLOW`; `DENY` · `not_permitted` |
+| AT-73 | Payment state `canceled`; `refund` 2 000 USD by `support_agent` | `ALLOW` (refunds keep their rules) |
+
+**Amendment 8** (AT-74…AT-76 core, AT-77 service). The tests generate an Ed25519 key pair.
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-74 | `charge` 4 900 USD on `inv_456` | the `proof` verifies with the public key, not with another key, and with a list holding another key and the right one (rotation); it signs exactly the nine fields; each signed field the decision also carries is equal; and the signed `subject`, `action` and `resource` are **this request's** (the signature cannot cover another request) |
+| AT-75 | The same, with `proof.signed.obligations[0].value` changed to 50 000 | the altered proof does not verify |
+| AT-76 | The same request twice with one `idempotencyKey` | the replay carries the identical `proof`, which still verifies |
+| AT-77 | `POST /v1/authorize` (AT-47's request) | 200, and the `proof` received over HTTP verifies |
+
 AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
 `"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
 
@@ -508,7 +582,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-63 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-77 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -520,6 +594,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 63 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3) pass locally and in CI; CI builds and tests.
+2. All 77 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
