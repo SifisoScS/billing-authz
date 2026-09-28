@@ -1,4 +1,14 @@
-# billing-authz — Specification v1.6
+# billing-authz — Specification v1.7
+
+> **Amendment 9 (2026-09-28): key ids, published keys, service roles, starting a subscription.**
+> Every `proof` names its key (**`kid`**, the key's RFC 7638 thumbprint), so a verifier selects
+> the key instead of trying each one. billing-authz-api publishes its keys at
+> **`GET /.well-known/jwks.json`** (the current key, and the previous one during a rotation).
+> **Roles now restrict services too**, where a permission lists roles: services get roles from
+> billing-auth, and `settlement_charge` is limited to `billing_service` and `dunning_service`.
+> New action **`start_subscription`** (billing-core BC-30), for `billing_operator` and
+> `billing_admin`; it must name the account as its `resource` (billing-core BC-34).
+> AT-78…AT-84.
 
 > **Amendment 8 (2026-09-28): signed decisions.** billing-core executes a billing change only with
 > a billing-authz decision (billing-core BC-19, BC-23), and an unsigned decision could be forged
@@ -139,7 +149,8 @@ interface SubjectRef { type: SubjectType; id: string }
 type Action =
   | "charge" | "refund" | "credit" | "upgrade" | "downgrade" | "cancel"
   | `use_feature:${string}`
-  | "settlement_charge" | "reactivate" | "invite_member";      // Amendment 7
+  | "settlement_charge" | "reactivate" | "invite_member"       // Amendment 7
+  | "start_subscription";                                        // Amendment 9
 
 interface ResourceRef { type: "account" | "subscription" | "invoice" | "seat"; id: string }
 
@@ -195,6 +206,7 @@ interface Decision {
 
 interface Proof {
   alg: "Ed25519";
+  kid: string;               // Amendment 9: the signing key's RFC 7638 thumbprint (base64url SHA-256)
   signed: {                  // exactly these nine fields, signed in canonical JSON (§7's form)
     decisionId: string; subject: SubjectRef; action: Action; resource?: ResourceRef;
     inputsHash: string; decision: DecisionKind; obligations: Obligation[];
@@ -205,8 +217,10 @@ interface Proof {
 ```
 
 A verifier (billing-core) checks the signature with billing-authz's public key and then trusts the
-**signed** fields only. `verifyProof(proof, publicKeys)` accepts a list, so the current and the
-previous key both verify during the 30-day rotation window.
+**signed** fields only. `verifyProof(proof, publicKeys)` takes the published keys (PEM, key
+objects or JWKs) and checks the proof with **the key its `kid` names** (Amendment 9); a `kid` that
+names no published key does not verify. During the 30-day rotation window both the current and the
+previous key are published, so proofs signed with either verify.
 
 ### 4.2 Engine
 
@@ -292,7 +306,7 @@ Zones contain only ISO-3166 alpha-2 codes; they do not nest. The rule applies to
 |---|---|---|
 | 1 | `identity` | Unknown subject → `deny` `unknown_subject`. Status `suspended` / `closed` → `deny` `subject_suspended` / `subject_closed`. |
 | 2 | `hard_blocks` | Subject flag `fraud` or `legal_hold` → `deny` `fraud_hold` / `legal_hold`. A blocked region → `deny` `region_blocked`. |
-| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin` and `user`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in the current plan's `upgradeTo` / `downgradeTo` (Amendment 6); otherwise `deny` `plan_not_permitted`. The current plan is read from `PlanSource` (Amendment 5): the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
+| 3 | `permission` | **Default-deny:** the action must be listed in `permissions` for the subject's type (and, for `admin`, `user` and — since Amendment 9 — `service`, one of its roles **when the permission lists roles**); otherwise `deny` `not_permitted`. **Operator thresholds:** `refund` and `credit` whose `amount` exceeds `operator.financeThreshold[currency]` require role `finance`; an unlisted currency always requires it; otherwise `deny` `role_required`. **Features:** `use_feature:<key>` also needs an entitlement for `<key>` valid at *now*; otherwise `deny` `not_entitled`. **Plans:** `upgrade` / `downgrade` need `context.plan` to appear in the current plan's `upgradeTo` / `downgradeTo` (Amendment 6); otherwise `deny` `plan_not_permitted`. The current plan is read from `PlanSource` (Amendment 5): the subject's, or **for an `admin`, that of the `resource` account** (Amendment 2). |
 | 4 | `quota` | If `quantity` is present, per the quota's mode, where *above the limit* means `used + quantity > limit`: `hard` → `deny` `quota_exceeded`; `soft` → `limit` `quota_warning`; `overage` → `limit` `overage_billable` with `units = used + quantity − limit`. |
 | 5 | `payment_health` | **Cancelled** (Amendment 7): payment state `canceled` and the action in the policy's `cancelledDenies` (default `charge`, `upgrade`, `downgrade`, every `use_feature:*`) → `deny` `subscription_canceled`. **Past due** applies to **premium actions** only: the policy's `premiumActions` (default `upgrade` and every `use_feature:*`). **Never `charge`**: collecting from a past-due account (dunning) must stay possible. Payment state `past_due` beyond grace (`now > graceUntil`) → `deny` `past_due` with `details.grace_until`. Within grace (`now ≤ graceUntil`) → `limit` `grace_until`. |
 | 6 | `risk` | Applies to actions with an `amount`. Score ≥ `risk.denyAt` (default 80) → `deny` `risk_high`. Score ≥ `risk.verifyAt` (default 50) → `verify` `risk_elevated`, **unless** `context.verification` completed within `risk.verificationMaxAgeSeconds` (default 600) and not later than *now* (a future timestamp is not accepted), in which case `pass` with reason `verified`. **Timeout** (no score within `risk.timeoutMs`, default 250): if `amount ≥ risk.highValueAmount[currency]`, or the currency is unlisted → `deny` `risk_unavailable` (fail-closed); otherwise `limit` `risk_unchecked` (fail-open). |
@@ -332,7 +346,8 @@ policy sets `ttl.byAction[action]`. `expiresAt = evaluatedAt + ttlSeconds`.
 `amount` is not an integer in `0…10^12` · `amount` is present without a valid three-letter
 `currency` · `quantity` is not a non-negative integer · `upgrade` / `downgrade` lacks `plan` ·
 `verification.at` is not a valid ISO-8601 time · `quantity` on an action other than `use_feature:<key>` ·
-an `admin`'s `upgrade` / `downgrade` without a `resource` of type `account`. **Nothing is evaluated
+an `admin`'s `upgrade` / `downgrade` without a `resource` of type `account` · a `start_subscription`
+without a `resource` of type `account` (Amendment 9). **Nothing is evaluated
 or logged** for an invalid request.
 
 ### 5.7 Side effects
@@ -367,7 +382,7 @@ interface PolicyRules {
 
 | Rule | Default |
 |---|---|
-| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user · **Amendment 7:** `settlement_charge`: service; admin with `billing_admin` · `reactivate`: user or admin with `customer_owner`, `billing_admin` or `support_manager` · `invite_member`: user or admin with `customer_owner` or `billing_operator` |
+| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user · **Amendment 7:** `settlement_charge`: service; admin with `billing_admin` · `reactivate`: user or admin with `customer_owner`, `billing_admin` or `support_manager` · `invite_member`: user or admin with `customer_owner` or `billing_operator` · **Amendment 9:** `settlement_charge`: service with `billing_service` or `dunning_service`; admin with `billing_admin` · `start_subscription`: admin with `billing_operator` or `billing_admin` |
 | `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500, ZAR: 45000 }` ($25 and equivalents; R 450) |
 | `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` · `timeoutMs 250` |
 | `premiumActions` | `upgrade`, `use_feature:*` |
@@ -437,11 +452,13 @@ share an `idempotencyKey`, the whole batch fails `INVALID_REQUEST` (with the off
 | `POST` | `/v1/authorize/batch` | `{ "requests": AuthorizeRequest[] }` (≤ 100) → `{ "decisions": Decision[] }` |
 | `GET` | `/v1/policies/active` | → `{ "version", "effective_at" }` |
 | `GET` | `/health` | → `{ "status": "ok" }` (the engine's smoke test) |
+| `GET` | `/.well-known/jwks.json` | → `{ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x", "kid", "use": "sig" }, …] }`: the current key, then the previous one during a rotation (Amendment 9) |
 
 Wire format follows the blueprint (`idempotency_key`, `policy_version`, `decision_id`,
 `ttl_seconds`, plus `expires_at`). Configuration from environment variables (`PORT`, default 3000;
 `HOST`, default `localhost`; `POLICY_FILE`; `SIGNING_KEY_FILE`, the path of the Ed25519 private
-key in PEM, Amendment 8); **no secret has a default value**: without a signing key the service does
+key in PEM, Amendment 8; `PREVIOUS_PUBLIC_KEY_FILE`, optional, the previous public key during a
+rotation, Amendment 9); **no secret has a default value**: without a signing key the service does
 not start. The `proof` crosses the wire **unchanged** (its field names are the signed ones). On start the service
 logs `billing-authz-api running on port <PORT>` (the engine's API smoke test waits for "running on
 port"). Caller authentication and resource ownership are out of this slice (§3.4), and the README
@@ -458,7 +475,7 @@ policy of §6 published as version `2026-09-01` (effective `2026-09-01T00:00:00Z
 otherwise, the account `acct_123` is active, in region `EU`, on the plan `starter` (from the plan
 source: `upgradeTo: ["pro"]`, `downgradeTo: []`, `limits.maxAmount: { USD: 5000, EUR: 5000, GBP: 5000,
 ZAR: 90000 }`; Amendment 6), with payment state `active` and an entitlement to `advanced_export`; risk is
-low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin_support` (role
+low (score 10). The other subjects are `user_1`, `svc_billing` (service; role `billing_service` since Amendment 9), `admin_support` (role
 `support_agent`) and `admin_finance` (role `finance`), all active (Amendment 2).
 
 **Core (`billing-authz`)**
@@ -570,6 +587,20 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service), `admin
 | AT-76 | The same request twice with one `idempotencyKey` | the replay carries the identical `proof`, which still verifies |
 | AT-77 | `POST /v1/authorize` (AT-47's request) | 200, and the `proof` received over HTTP verifies |
 
+**Amendment 9** (AT-78, AT-81…AT-84 core; AT-79, AT-80 service). The tests also generate a
+*previous* key pair, published during a rotation. New subject: `svc_reporting` (service, role
+`reporting_service`); `svc_dunning` has role `dunning_service`.
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-78 | `charge` 4 900 USD | the proof's `kid` is the current key's; it verifies against the published keys (current and previous), selected by `kid`; the same proof naming the previous key's `kid` does not verify |
+| AT-79 | `GET /.well-known/jwks.json` | 200; `keys` = the current key, then the previous key, as JWKs |
+| AT-80 | `POST /v1/authorize` (AT-47's request) | 200; the `proof` verifies with the keys fetched from `/.well-known/jwks.json`: a verifier needs nothing else |
+| AT-81 | `settlement_charge` 1 000 USD by `svc_billing`; by `svc_reporting`; a `charge` by `svc_reporting` | `ALLOW`; `DENY` · `not_permitted`; not denied (roles restrict only where a permission lists them) |
+| AT-82 | `start_subscription` for `acct_123` by `admin_ops` (`billing_operator`); by `admin_billing`; by `admin_support` | `ALLOW`; `ALLOW`; `DENY` · `not_permitted` |
+| AT-83 | `start_subscription` by `acct_123` itself; by `admin_ops` without a `resource` | `DENY` · `not_permitted` (customers go through business flows); `INVALID_REQUEST` |
+| AT-84 | Payment state `canceled`; `start_subscription` for `acct_123` by `admin_ops` | `ALLOW`: an ended subscription is followed by a new one |
+
 AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
 `"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
 
@@ -582,7 +613,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-77 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-84 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -594,6 +625,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 77 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8) pass locally and in CI; CI builds and tests.
+2. All 84 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8 + 7 from Amendment 9) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
