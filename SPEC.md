@@ -1,4 +1,12 @@
-# billing-authz — Specification v1.7
+# billing-authz — Specification v1.8
+
+> **Amendment 10 (2026-09-28): billing-core's operator writes.** Every billing-core operator write
+> now needs a billing-authz decision (billing-core BC-30, BC-36, and the state machine's C2):
+> **`create_account`** (`billing_operator`, `billing_admin`; it names an account id billing-core has
+> reserved), and **`suspend_account`, `unsuspend_account`, `flag_account`, `unflag_account`,
+> `grant_entitlement`, `close_account`, `manage_plan_catalogue`** (`billing_admin` only). Each must
+> name what it changes as its `resource`: the account, or, for `manage_plan_catalogue`, the **plan**
+> (a new resource type, `plan`). AT-85…AT-89.
 
 > **Amendment 9 (2026-09-28): key ids, published keys, service roles, starting a subscription.**
 > Every `proof` names its key (**`kid`**, the key's RFC 7638 thumbprint), so a verifier selects
@@ -150,9 +158,12 @@ type Action =
   | "charge" | "refund" | "credit" | "upgrade" | "downgrade" | "cancel"
   | `use_feature:${string}`
   | "settlement_charge" | "reactivate" | "invite_member"       // Amendment 7
-  | "start_subscription";                                        // Amendment 9
+  | "start_subscription"                                         // Amendment 9
+  | "create_account" | "suspend_account" | "unsuspend_account"   // Amendment 10
+  | "flag_account" | "unflag_account" | "grant_entitlement"
+  | "close_account" | "manage_plan_catalogue";
 
-interface ResourceRef { type: "account" | "subscription" | "invoice" | "seat"; id: string }
+interface ResourceRef { type: "account" | "subscription" | "invoice" | "seat" | "plan"; id: string }   // plan: Amendment 10
 
 interface Verification {
   method: "sca" | "step_up";
@@ -347,7 +358,9 @@ policy sets `ttl.byAction[action]`. `expiresAt = evaluatedAt + ttlSeconds`.
 `currency` · `quantity` is not a non-negative integer · `upgrade` / `downgrade` lacks `plan` ·
 `verification.at` is not a valid ISO-8601 time · `quantity` on an action other than `use_feature:<key>` ·
 an `admin`'s `upgrade` / `downgrade` without a `resource` of type `account` · a `start_subscription`
-without a `resource` of type `account` (Amendment 9). **Nothing is evaluated
+without a `resource` of type `account` (Amendment 9) · any of Amendment 10's account actions without a
+`resource` of type `account`, or a `manage_plan_catalogue` without a `resource` of type `plan`
+(Amendment 10). **Nothing is evaluated
 or logged** for an invalid request.
 
 ### 5.7 Side effects
@@ -382,7 +395,7 @@ interface PolicyRules {
 
 | Rule | Default |
 |---|---|
-| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user · **Amendment 7:** `settlement_charge`: service; admin with `billing_admin` · `reactivate`: user or admin with `customer_owner`, `billing_admin` or `support_manager` · `invite_member`: user or admin with `customer_owner` or `billing_operator` · **Amendment 9:** `settlement_charge`: service with `billing_service` or `dunning_service`; admin with `billing_admin` · `start_subscription`: admin with `billing_operator` or `billing_admin` |
+| `permissions` | `charge`: account, service · `refund`, `credit`: admin with role `support_agent` or `finance` · `upgrade`, `downgrade`, `cancel`: account; admin with `support_agent` or `finance` · `use_feature:*`: account, user · **Amendment 7:** `settlement_charge`: service; admin with `billing_admin` · `reactivate`: user or admin with `customer_owner`, `billing_admin` or `support_manager` · `invite_member`: user or admin with `customer_owner` or `billing_operator` · **Amendment 9:** `settlement_charge`: service with `billing_service` or `dunning_service`; admin with `billing_admin` · `start_subscription`: admin with `billing_operator` or `billing_admin` · **Amendment 10:** `create_account`: admin with `billing_operator` or `billing_admin` · `suspend_account`, `unsuspend_account`, `flag_account`, `unflag_account`, `grant_entitlement`, `close_account`, `manage_plan_catalogue`: admin with `billing_admin` |
 | `operator.financeThreshold` | `{ USD: 2500, EUR: 2500, GBP: 2500, JPY: 3500, ZAR: 45000 }` ($25 and equivalents; R 450) |
 | `risk` | `denyAt 80` · `verifyAt 50` · `highValueAmount { USD: 10000, EUR: 10000, GBP: 10000, JPY: 15000, ZAR: 180000 }` ($100 and equivalents; R 1 800) · `verificationMaxAgeSeconds 600` · `timeoutMs 250` |
 | `premiumActions` | `upgrade`, `use_feature:*` |
@@ -601,6 +614,16 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service; role `b
 | AT-83 | `start_subscription` by `acct_123` itself; by `admin_ops` without a `resource` | `DENY` · `not_permitted` (customers go through business flows); `INVALID_REQUEST` |
 | AT-84 | Payment state `canceled`; `start_subscription` for `acct_123` by `admin_ops` | `ALLOW`: an ended subscription is followed by a new one |
 
+**Amendment 10** (core, `billing-authz`).
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-85 | `create_account` for the reserved id `acct_new` by `admin_ops`; by `admin_billing`; by `admin_support` | `ALLOW`; `ALLOW`; `DENY` · `not_permitted` (no account exists yet, and none is read) |
+| AT-86 | `suspend_account`, `unsuspend_account`, `flag_account`, `unflag_account`, `grant_entitlement`, `close_account` on `acct_123` by `admin_billing` | `ALLOW` each |
+| AT-87 | The same six by `admin_ops` (`billing_operator`); `close_account` by `admin_support`; by `acct_123` itself | `DENY` · `not_permitted` each |
+| AT-88 | `manage_plan_catalogue` on the plan `pro` by `admin_billing`; by `admin_ops` | `ALLOW`; `DENY` · `not_permitted` |
+| AT-89 | `suspend_account` without a `resource`; `close_account` naming a plan; `create_account` without a `resource`; `manage_plan_catalogue` without a `resource`; naming an account | `INVALID_REQUEST` each |
+
 AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
 `"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
 
@@ -613,7 +636,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-84 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-89 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -625,6 +648,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 84 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8 + 7 from Amendment 9) pass locally and in CI; CI builds and tests.
+2. All 89 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8 + 7 from Amendment 9 + 5 from Amendment 10) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
