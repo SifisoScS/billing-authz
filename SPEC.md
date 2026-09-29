@@ -1,4 +1,12 @@
-# billing-authz — Specification v1.8
+# billing-authz — Specification v1.9
+
+> **Amendment 11 (2026-09-29): the command is signed; unknown fields are refused.** A billing-core
+> command's own arguments (a subscription's period and trial, a flag, a grant, a catalogue change,
+> an invitation) had no field in the request, so the signature could not bind them. The request
+> gains **`context.command`**: those arguments, **signed** (a tenth signed field, `command`) and
+> hashed, **never evaluated**; billing-core refuses a command whose arguments differ from the signed
+> ones. And **a field the request does not declare is now `INVALID_REQUEST`**, not accepted
+> silently: the signed boundary is intentional, not incidental (founder). AT-90…AT-93.
 
 > **Amendment 10 (2026-09-28): billing-core's operator writes.** Every billing-core operator write
 > now needs a billing-authz decision (billing-core BC-30, BC-36, and the state machine's C2):
@@ -180,6 +188,7 @@ interface Context {
   verification?: Verification;
   ip?: string;
   riskHints?: Record<string, string | number | boolean>;
+  command?: Record<string, unknown>;   // Amendment 11: the billing-core command's arguments; signed and hashed, never evaluated
 }
 
 interface AuthorizeRequest {
@@ -218,10 +227,11 @@ interface Decision {
 interface Proof {
   alg: "Ed25519";
   kid: string;               // Amendment 9: the signing key's RFC 7638 thumbprint (base64url SHA-256)
-  signed: {                  // exactly these nine fields, signed in canonical JSON (§7's form)
+  signed: {                  // exactly these ten fields, signed in canonical JSON (§7's form)
     decisionId: string; subject: SubjectRef; action: Action; resource?: ResourceRef;
     inputsHash: string; decision: DecisionKind; obligations: Obligation[];
     policyVersion: string; expiresAt: string;
+    command?: Record<string, unknown>;   // Amendment 11: context.command, as sent
   };
   signature: string;         // base64 Ed25519 signature over the canonical JSON of `signed`
 }
@@ -360,7 +370,8 @@ policy sets `ttl.byAction[action]`. `expiresAt = evaluatedAt + ttlSeconds`.
 an `admin`'s `upgrade` / `downgrade` without a `resource` of type `account` · a `start_subscription`
 without a `resource` of type `account` (Amendment 9) · any of Amendment 10's account actions without a
 `resource` of type `account`, or a `manage_plan_catalogue` without a `resource` of type `plan`
-(Amendment 10). **Nothing is evaluated
+(Amendment 10) · **any field the request, its context or a nested record does not declare**
+(Amendment 11; maps such as `riskHints` and `command` keep free-form keys). **Nothing is evaluated
 or logged** for an invalid request.
 
 ### 5.7 Side effects
@@ -595,7 +606,7 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service; role `b
 
 | ID | Given / When | Then |
 |---|---|---|
-| AT-74 | `charge` 4 900 USD on `inv_456` | the `proof` verifies with the public key, not with another key, and with a list holding another key and the right one (rotation); it signs exactly the nine fields; each signed field the decision also carries is equal; and the signed `subject`, `action` and `resource` are **this request's** (the signature cannot cover another request) |
+| AT-74 | `charge` 4 900 USD on `inv_456` | the `proof` verifies with the public key, not with another key, and with a list holding another key and the right one (rotation); it signs exactly the ten fields (Amendment 11 added `command`); each signed field the decision also carries is equal; and the signed `subject`, `action` and `resource` are **this request's** (the signature cannot cover another request) |
 | AT-75 | The same, with `proof.signed.obligations[0].value` changed to 50 000 | the altered proof does not verify |
 | AT-76 | The same request twice with one `idempotencyKey` | the replay carries the identical `proof`, which still verifies |
 | AT-77 | `POST /v1/authorize` (AT-47's request) | 200, and the `proof` received over HTTP verifies |
@@ -624,6 +635,15 @@ low (score 10). The other subjects are `user_1`, `svc_billing` (service; role `b
 | AT-88 | `manage_plan_catalogue` on the plan `pro` by `admin_billing`; by `admin_ops` | `ALLOW`; `DENY` · `not_permitted` |
 | AT-89 | `suspend_account` without a `resource`; `close_account` naming a plan; `create_account` without a `resource`; `manage_plan_catalogue` without a `resource`; naming an account | `INVALID_REQUEST` each |
 
+**Amendment 11** (AT-90…AT-92 core, AT-93 service).
+
+| ID | Given / When | Then |
+|---|---|---|
+| AT-90 | An unknown request field (`coupon`); an unknown `context` field; an unknown field in the `resource`; free-form keys in `riskHints` | `INVALID_REQUEST`; `INVALID_REQUEST`; `INVALID_REQUEST`; not denied (a map keeps its keys) |
+| AT-91 | `start_subscription` for `acct_123` by `admin_ops` with `context.command` `{ plan: pro, billingPeriod: monthly, trialStart, trialEnd }` | `ALLOW`; the proof verifies and its signed `subject`, `action`, `resource` and `command` are this request's |
+| AT-92 | The same with `{ plan: pro, billingPeriod: monthly }`, and the signed `command.billingPeriod` changed to `yearly` | the altered proof does not verify: a monthly decision cannot become yearly |
+| AT-93 | `POST /v1/authorize` with an unknown field | 400 `INVALID_REQUEST` |
+
 AT-04, AT-30 and AT-47 keep their meaning under the new default: the fixture account's region
 `"EU"` is a zone, and every EU member is in the EEA (matching rule 3).
 
@@ -636,7 +656,7 @@ Implementation arrives through pull requests the founder merges (AE-D12).
 | Level | Criterion (RMM v2) | How this spec satisfies it | Evidence the engine collects |
 |---|---|---|---|
 | RMM-1 | integrity · clean install · build · smoke | Engine-scaffolded repos with `system.json`; `npm ci` + `npm run build`; core: `node dist/index.js` exits 0; service: `/health` 200 | `verify-assets`; `promote` deep run |
-| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-89 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
+| RMM-2 | own tests pass · CI green on the current commit · CI builds **and** tests | AT-01…AT-93 under `npm test`; template CI (install, build, test, smoke) | deep run; `actions/workflows/ci.yml` runs |
 | RMM-3 | direct evidence · N ≥ 0.5 · ≥ 150 original lines · original passing tests · README says what it does | Original engine, policy store, log and HTTP layer. Expected core ≫ 150 lines. README from §1–§3 with install and usage, and §3.4 | `engine promote` (Novelty vs template, siblings **and reference assets**, AE-D28) |
 | RMM-4 | consumed by an RMM-3+ repo | **Core:** `billing-authz-api` depends on and imports it (AT-53). **Service:** no consumer in the pilot | `promote` consumer check (dependency + import) |
 | RMM-5 | P = 1.0 + release/package/deployment | MIT LICENSE · no default secrets · `npm audit` clean · README install+usage · `engines.node ≥ 20` · GitHub release `v0.1.0` | `promote` readiness checks |
@@ -648,6 +668,6 @@ separate specification and ledger entry.
 ## 13. Definition of done (this slice)
 
 1. Both repos exist, created after their ledger entries, with this `SPEC.md` in their first commit.
-2. All 89 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8 + 7 from Amendment 9 + 5 from Amendment 10) pass locally and in CI; CI builds and tests.
+2. All 93 acceptance tests (53 founding + 7 from Amendment 1 + 3 from Amendment 3 + 10 from Amendment 7 + 4 from Amendment 8 + 7 from Amendment 9 + 5 from Amendment 10 + 4 from Amendment 11) pass locally and in CI; CI builds and tests.
 3. `engine promote billing-authz-api`, then `engine promote billing-authz`: the service at RMM-3+, the core at RMM-4+, provenance `pipeline` for both.
 4. `engine scorecard` shows **Pipeline Asset Count ≥ 2**.
